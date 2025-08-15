@@ -44,7 +44,7 @@ void generateRandomCostMatrix(int size, std::vector<double>& costMatrix, int mpi
         vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, stream, size * size, randomValues.data(), 1.0, MAX_COST + 1.0);
         vslDeleteStream(&stream);
    
-#pragma omp parallel for collapse(2) schedule(dynamic, chunk_size)
+#pragma omp parallel for schedule(dynamic, chunk_size)
         for (int col = 0; col < size; ++col) {
             for (int row = 0; row < size; ++row) {
                 if (row != col) {
@@ -110,7 +110,7 @@ void generateRandomCostMatrix(int size, std::vector<double>& costMatrix, int mpi
         }
 
         // Заполняем матрицу расстояний
-#pragma omp parallel for collapse(2) schedule(dynamic, chunk_size)
+#pragma omp parallel for schedule(dynamic, chunk_size)
         for (int col = 0; col < size; ++col) {
             for (int row = 0; row < col; ++row) {
                 double dx = points[row].first - points[col].first;
@@ -347,30 +347,28 @@ std::vector<int> CycleMergingAlgorithm(const std::vector<double>& costMatrix, co
 
 struct Result {
     double totalAssignmentCost;
-    double totalAssignmentTime;
     double totalParallelTSPSolutionCost;
     double totalParallelTime;
 };
 
 // Функция для создания пользовательского типа MPI для структуры Result
 void create_mpi_result_type(MPI_Datatype& mpi_result_type) {
-    int count = 4;
-    int block_lengths[4] = { 1, 1, 1, 1 };
-    MPI_Datatype types[4] = { MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE };
-    MPI_Aint offsets[4];
+    int count = 3;
+    int block_lengths[3] = { 1, 1, 1 };
+    MPI_Datatype types[3] = { MPI_DOUBLE, MPI_DOUBLE, MPI_DOUBLE };
+    MPI_Aint offsets[3];
 
     offsets[0] = offsetof(Result, totalAssignmentCost);
-    offsets[1] = offsetof(Result, totalAssignmentTime);
-    offsets[2] = offsetof(Result, totalParallelTSPSolutionCost);
-    offsets[3] = offsetof(Result, totalParallelTime);
+    offsets[1] = offsetof(Result, totalParallelTSPSolutionCost);
+    offsets[2] = offsetof(Result, totalParallelTime);
 
     MPI_Type_create_struct(count, block_lengths, offsets, types, &mpi_result_type);
     MPI_Type_commit(&mpi_result_type);
 }
 
-Result solve_tsp_task(const std::vector<double>& task_data, int task_size) {
+Result solve_tsp_task(int task_size) {
 
-    Result result = { 0.0, 0.0, 0.0, 0.0 };
+    Result result = { 0.0, 0.0, 0.0};
 
     int vertices = task_size;
 
@@ -378,9 +376,9 @@ Result solve_tsp_task(const std::vector<double>& task_data, int task_size) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
     std::vector<double> costMatrix;
-    generateRandomCostMatrix(vertices, costMatrix, rank, 2);
+    generateRandomCostMatrix(vertices, costMatrix, rank, 3);
 
-    auto startAssPrb = chrono::high_resolution_clock::now();
+    auto startPar = chrono::high_resolution_clock::now();
     HungarianAlgorithm HungAlgo;
     vector<int> assignment;
     double assignmentCost = 0;
@@ -390,8 +388,6 @@ Result solve_tsp_task(const std::vector<double>& task_data, int task_size) {
         cout << "Error" << endl;
         return result;
     }
-    auto endAssPrb = chrono::high_resolution_clock::now();
-    chrono::duration<double> elapsedAssPrb = endAssPrb - startAssPrb;
 
     for (int i = 0; i < vertices; ++i) {
         costMatrix[i] = -costMatrix[i];
@@ -399,14 +395,13 @@ Result solve_tsp_task(const std::vector<double>& task_data, int task_size) {
     }
 
     // Параллельное решение
-    auto startPar = chrono::high_resolution_clock::now();
+
     double CMACost = 0;
     vector<int> CMACycle = CycleMergingAlgorithm(costMatrix, cycleCover, CMACost, vertices);
     auto endPar = chrono::high_resolution_clock::now();
     chrono::duration<double> elapsedPar = endPar - startPar;
 
     result.totalAssignmentCost = assignmentCost;
-    result.totalAssignmentTime = elapsedAssPrb.count();
     result.totalParallelTSPSolutionCost = CMACost;
     result.totalParallelTime = elapsedPar.count();
 
@@ -416,7 +411,7 @@ Result solve_tsp_task(const std::vector<double>& task_data, int task_size) {
 }
 
 // Мастер-процесс распределяет задачи и собирает результаты
-void master_process(int num_tasks, int num_workers, int task_size, ofstream& outputFile, MPI_Datatype mpi_result_type) {
+/*void master_process(int num_tasks, int num_workers, int task_size, ofstream& outputFile, MPI_Datatype mpi_result_type) {
     vector<double> task_data(task_size);
     int task_index = 0;
     int completed_tasks = 0;
@@ -463,10 +458,69 @@ void master_process(int num_tasks, int num_workers, int task_size, ofstream& out
 
     // Дождаться завершения всех отправок
     MPI_Waitall(num_workers, send_requests.data(), MPI_STATUSES_IGNORE);
+}*/
+
+void master_process(int num_tasks, int num_workers, int task_size, ofstream& outputFile, MPI_Datatype mpi_result_type) {
+    vector<double> task_data(task_size);
+    int task_index = 0;
+    int completed_tasks = 0;
+
+    vector<MPI_Request> send_requests(num_workers);
+    vector<MPI_Request> recv_requests(num_workers);
+    vector<Result> recv_results(num_workers);
+    MPI_Status status;
+
+    // Засекаем время начала
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // Отправка начальных задач
+    for (int i = 0; i < num_workers && task_index < num_tasks; ++i, ++task_index) {
+        int worker_rank = i + 1;
+        MPI_Isend(task_data.data(), task_size, MPI_DOUBLE, worker_rank, 0, MPI_COMM_WORLD, &send_requests[i]);
+        MPI_Irecv(&recv_results[i], 1, mpi_result_type, worker_rank, MPI_ANY_TAG, MPI_COMM_WORLD, &recv_requests[i]);
+        std::cout << "Task " << task_index + 1 << " sent to worker " << worker_rank << std::endl;
+    }
+
+    // Получение результатов и отправка следующих задач
+    while (completed_tasks < num_tasks) {
+        int index;
+        MPI_Waitany(num_workers, recv_requests.data(), &index, &status);
+
+        ++completed_tasks;
+        const Result& result = recv_results[index];
+
+        outputFile << task_size << "\t"
+            << result.totalAssignmentCost << "\t"
+            //<< result.totalAssignmentTime << "\t"
+            << result.totalParallelTSPSolutionCost << "\t"
+            << result.totalParallelTime << std::endl;
+
+        if (task_index < num_tasks) {
+            int worker_rank = index + 1;
+            MPI_Isend(task_data.data(), task_size, MPI_DOUBLE, worker_rank, 0, MPI_COMM_WORLD, &send_requests[index]);
+            MPI_Irecv(&recv_results[index], 1, mpi_result_type, worker_rank, MPI_ANY_TAG, MPI_COMM_WORLD, &recv_requests[index]);
+            std::cout << "Task " << task_index + 1 << " sent to worker " << worker_rank << std::endl;
+            ++task_index;
+        }
+        else {
+            // Завершение воркера
+            int worker_rank = index + 1;
+            MPI_Isend(NULL, 0, MPI_DOUBLE, worker_rank, 1, MPI_COMM_WORLD, &send_requests[index]);
+        }
+    }
+
+    MPI_Waitall(num_workers, send_requests.data(), MPI_STATUSES_IGNORE);
+
+    // Засекаем время конца
+    //auto end_time = std::chrono::high_resolution_clock::now();
+    //double total_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(end_time - start_time).count();
+
+    // Записываем результат: task_size и общее время в секундах
+    //outputFile << task_size << "\t" << total_seconds << std::endl;
 }
 
 // Worker-процессы
-void worker_process(int task_size, MPI_Datatype mpi_result_type) {
+/*void worker_process(int task_size, MPI_Datatype mpi_result_type) {
     vector<double> task_data(task_size);
     Result result;
     MPI_Request send_request, recv_request;
@@ -486,9 +540,36 @@ void worker_process(int task_size, MPI_Datatype mpi_result_type) {
         MPI_Isend(&result, 1, mpi_result_type, 0, 0, MPI_COMM_WORLD, &send_request);
         MPI_Wait(&send_request, MPI_STATUSES_IGNORE);
     }
+}*/
+
+void worker_process(int task_size, MPI_Datatype mpi_result_type) {
+    vector<double> task_data(task_size);
+    Result result;
+    MPI_Request send_request, recv_request;
+    MPI_Status status;
+
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    while (true) {
+        MPI_Irecv(task_data.data(), task_size, MPI_DOUBLE, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &recv_request);
+        MPI_Wait(&recv_request, &status);
+
+        if (status.MPI_TAG == 1) {
+            std::cout << "Worker " << rank << " received termination signal." << std::endl;
+            break;
+        }
+
+        std::cout << "Worker " << rank << " received task." << std::endl;
+        result = solve_tsp_task(task_size);
+        std::cout << "Worker " << rank << " sending result." << std::endl;
+
+        MPI_Isend(&result, 1, mpi_result_type, 0, 0, MPI_COMM_WORLD, &send_request);
+        MPI_Wait(&send_request, MPI_STATUSES_IGNORE);
+    }
 }
 
-int main(int argc, char* argv[])
+/*int main(int argc, char* argv[])
 {
     omp_set_num_threads(omp_get_max_threads()); // Установить максимальное число потоков
     MPI_Init(&argc, &argv);
@@ -537,5 +618,61 @@ int main(int argc, char* argv[])
     MPI_Type_free(&mpi_result_type);
 
     MPI_Finalize();
+    return 0;
+}*/
+int main(int argc, char* argv[]) {
+    // Настройка OpenMP
+    omp_set_num_threads(omp_get_max_threads());
+
+    // Инициализация MPI
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Создание пользовательского типа для Result
+    MPI_Datatype mpi_result_type;
+    create_mpi_result_type(mpi_result_type);
+
+    std::ofstream outputFile;
+    if (rank == 0) {
+        outputFile.open("results.txt");
+        outputFile << "Number of vertices\tParallel time (s)" << std::endl;
+    }
+
+    // Можно протестировать несколько размеров графа
+    for (int vertices = 100; vertices <= 400; vertices += 100) {
+        int numTrials = 100;
+
+        if (rank == 0) {
+            int num_workers = size - 1;
+            if (num_workers == 0) {
+                std::cerr << "Error: at least one worker process is required." << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+
+            std::cout << "Master started: running " << numTrials << " tasks with "
+                << num_workers << " workers for graph size " << vertices << std::endl;
+
+            master_process(numTrials, num_workers, vertices, outputFile, mpi_result_type);
+        }
+        else {
+            worker_process(vertices, mpi_result_type);
+        }
+
+        // Все процессы синхронизируются перед следующей итерацией
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    if (rank == 0) {
+        std::cout << "All tasks completed." << std::endl;
+        outputFile.close();
+    }
+
+    // Очистка ресурсов
+    MPI_Type_free(&mpi_result_type);
+    MPI_Finalize();
+
     return 0;
 }

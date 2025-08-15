@@ -5,8 +5,10 @@
 #include <mkl.h>
 #include "Hungarian.h"
 #include <omp.h>
+#include <cfloat> 
+#include <limits>
 
-#define DBL_EPSILON 2.2204460492503131e-16
+//#define DBL_EPSILON 2.2204460492503131e-16
 
 HungarianAlgorithm::HungarianAlgorithm() {}
 HungarianAlgorithm::~HungarianAlgorithm() {}
